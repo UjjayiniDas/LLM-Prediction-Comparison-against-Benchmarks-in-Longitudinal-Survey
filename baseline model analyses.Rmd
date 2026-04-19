@@ -834,7 +834,7 @@ smd_categorical <- function(var_vec, group_vec) {
 
 
 # ------------ 3. DEMOGRAPHIC COMPARISON TABLE ------------------------------------------
-demo_vars <- c("snap",                                           # ── NEW
+demo_vars <- c("snap",                                           
                "sex", "race", "hispanic.origin", "education",
                "marital.status", "employment", "citizenship", "income")
 
@@ -856,7 +856,7 @@ age_summary <- attrition_df %>%
       age_num <- as.numeric(as.character(attrition_df$age))
       t.test(age_num ~ attrition_df$status)$p.value
     },
-    SMD = smd_continuous(attrition_df$age, attrition_df$status)  # ── NEW
+    SMD = smd_continuous(attrition_df$age, attrition_df$status)  
   )
 
 # Categorical variables
@@ -877,12 +877,12 @@ make_cat_table <- function(var) {
     error = function(e) NA_real_
   )
 
-  smd_val <- smd_categorical(attrition_df[[var]], attrition_df$status)  # ── NEW
+  smd_val <- smd_categorical(attrition_df[[var]], attrition_df$status)  
 
   tbl %>%
     mutate(
       p_value = if_else(row_number() == 1, chi_p, NA_real_),
-      SMD     = if_else(row_number() == 1, smd_val, NA_real_)           # ── NEW
+      SMD     = if_else(row_number() == 1, smd_val, NA_real_)           
     )
 }
 
@@ -906,12 +906,12 @@ attrition_table <- bind_rows(
 ) %>%
   arrange(Variable) %>%
   mutate(p_value = fmt_p(p_value),
-         SMD     = if_else(is.na(SMD), "", as.character(SMD)))  # ── NEW
+         SMD     = if_else(is.na(SMD), "", as.character(SMD)))  
 
 # ── 4. OUTPUT ─────────────────────────────────────────────────────────────────
 attrition_table %>%
   select(Variable, Category, Retained, Attrited,
-         `p-value` = p_value, SMD) %>%           # ── NEW: SMD column added
+         `p-value` = p_value, SMD) %>%          
   kable(
     format   = "latex",
     booktabs = TRUE,
@@ -934,8 +934,8 @@ implications for generalizability.",
 
 write.csv(attrition_table, "attrition_table2_appendix.csv", row.names = FALSE)
 
-# ── 3. WAVE-BY-WAVE SAMPLE FLOW TABLE ────────────────────────────────────────
-# Shows N retained at each cumulative threshold — useful for the paper body
+# ------------ 3. WAVE-BY-WAVE SAMPLE FLOW TABLE-----------------------------------------
+
 
 wave_flow <- tibble(
   Wave = c("Wave 1 (baseline)", "Through Wave 2",
