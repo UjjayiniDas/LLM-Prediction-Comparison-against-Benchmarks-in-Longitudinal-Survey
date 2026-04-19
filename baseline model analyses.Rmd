@@ -1,0 +1,1011 @@
+---
+title: "Baseline Models for Prediction"
+author: "Ujjayini Das"
+date: "2026-04-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Load `pacman` for pkg management
+if (!require("pacman", character.only = TRUE)){
+  install.packages("pacman", dep = TRUE)
+  if (!require("pacman", character.only = TRUE))
+    stop("Package not found")
+}
+
+# Packages to use
+pkgs <- c("tidyverse",    # General data manipulation
+          "dplyr",        # General data manipulation
+          "dbplyr",       # Interface for databases
+          "haven",        # Load Stata datasets
+          "RSQLite",      # SQL
+          "glue",         # For gluing
+          "survey",       # Survey data analysis
+          "srvyr",        # Survey data analysis
+          "readxl",       # excel file reading
+          "readr",        # reading text data
+          "data.table",   # handling data table
+          "purrr",
+          "stringr",      # data wrangling for text
+          "caret",
+          "xgboost",
+          "MLmetrics",
+          "rpart",        # CART decision tree
+          "randomForest", # Random forest
+          "ROSE",          # Random oversampling examples - fix class imbalance
+          "ggplot2",
+          "kableExtra"
+          )
+
+pacman::p_load(char = pkgs)
+rm(pkgs)
+```
+
+## Load data and preprocess for next steps
+
+```{r}
+# ------------------ Load all four raw wave files ----------------------------
+w1 <- read.csv("Data/wave1_processed_withINCOME.csv")
+w2 <- read.csv("Data/wave2_processed_withINCOME.csv")
+w3 <- read.csv("Data/wave3_processed_withINCOME.csv")
+w4 <- read.csv("Data/wave4_processed_withINCOME.csv")
+
+# ---------- Load income files ------------
+inc_w1 <- read.csv("Data/Wave1_raw_with_income.csv") %>%
+  select(unique_ID, THTOTINC) %>%
+  rename(ID = unique_ID, income_raw = THTOTINC)
+
+inc_w2 <- read.csv("Data/Wave2_raw_with_income.csv") %>%
+  select(unique_ID_2, THTOTINC) %>%
+  rename(ID = unique_ID_2, income_raw = THTOTINC)
+
+inc_w3 <- read.csv("Data/Wave3_raw_with_income.csv") %>%
+  select(unique_ID_2, THTOTINC) %>%
+  rename(ID = unique_ID_2, income_raw = THTOTINC)
+
+inc_w4 <- read.csv("Data/Wave4_raw_with_income.csv") %>%
+  select(unique_ID_2, THTOTINC) %>%
+  rename(ID = unique_ID_2, income_raw = THTOTINC)
+
+# Defining income levels for more variation
+bin_income <- function(x) {
+  case_when(
+    is.na(x)       ~ "No income or loss",
+    x <= 0         ~ "No income or loss",
+    x < 1000       ~ "Less than $1,000",
+    x < 2000       ~ "$1,000 to $1,999",
+    x < 3000       ~ "$2,000 to $2,999",
+    x < 5000       ~ "$3,000 to $4,999",
+    x < 10000      ~ "$5,000 to $9,999",
+    x < 25000      ~ "$10,000 to $24,999",
+    x < 50000      ~ "$25,000 to $49,999",
+    x < 75000      ~ "$50,000 to $74,999",
+    TRUE           ~ "$75,000 or more"
+  )
+}
+
+# Standardize the ID column name — Wave 1 uses unique_ID, others use unique_ID_2
+# Strip leading zeros from Wave 1 IDs to match later waves
+# Strip leading zeros from Wave 2-4 IDs to match Wave 1 format
+strip_zeros <- function(id) sub("^0+", "", id)
+
+# Join income into each processed wave file
+w1 <- w1 %>%
+  mutate(ID_nozero = strip_zeros(unique_ID))%>%
+  left_join(inc_w1, by = c("ID_nozero" = "ID")) %>%
+  mutate(income = bin_income(income_raw)) %>%
+  select(-income_raw)
+
+w2 <- w2 %>%
+  mutate(ID_nozero = strip_zeros(unique_ID_2)) %>%
+  left_join(inc_w2 %>% mutate(ID = strip_zeros(ID)), by = c("ID_nozero" = "ID")) %>%
+  mutate(income = bin_income(income_raw)) %>%
+  select(-income_raw, -unique_ID_2)
+
+w3 <- w3 %>%
+  mutate(ID_nozero = strip_zeros(unique_ID_2)) %>%
+  left_join(inc_w3 %>% mutate(ID = strip_zeros(ID)), by = c("ID_nozero" = "ID")) %>%
+  mutate(income = bin_income(income_raw)) %>%
+  select(-income_raw, -unique_ID_2)
+
+w4 <- w4 %>%
+  mutate(ID_nozero = strip_zeros(unique_ID_2)) %>%
+  left_join(inc_w4 %>% mutate(ID = strip_zeros(ID)), by = c("ID_nozero" = "ID")) %>%
+  mutate(income = bin_income(income_raw)) %>%
+  select(-income_raw, -unique_ID_2)
+# verify income distribution
+lapply(list(w1 = w1, w2 = w2, w3 = w3, w4 = w4), function(df) {
+  table(df$income, useNA = "ifany")
+})
+
+# ---------------- Prepare datasets for longitudinal prediction -----------------------
+# wave 1 data set - no longitudinal predictor
+df_wave1 <- w1 %>%
+  filter(imputed_snap == FALSE) %>%
+  select(ID_nozero, marital.status, sex, hispanic.origin, race,
+         education, citizenship, employment, state, age, income, SNAP)
+
+# wave 2 dataset - only wave 1 as longitudinal predictor
+# Pull Wave 1 SNAP outcome for each person (non-imputed only)
+snap_w1 <- w1 %>%
+  filter(imputed_snap == FALSE) %>%
+  select(ID_nozero, SNAP_wave1 = SNAP)
+
+# Merge Wave 2 data with Wave 1 outcome
+df_wave2 <- w2 %>%
+  filter(imputed_snap == FALSE) %>%
+  inner_join(snap_w1, by = "ID_nozero") %>%   # inner_join = only those in BOTH waves
+  mutate(SNAP = ifelse(snap == "SNAP covered", "Yes", "No")) %>%
+  select(ID_nozero, marital.status, sex, hispanic.origin, race,
+         education, citizenship, employment, state, age, income,
+         SNAP_wave1,   # <-- longitudinal predictor
+         SNAP)         # <-- outcome to predict
+
+# wave 3 dataset - wave 1 and 2 as longitudinal predictors
+snap_w2 <- w2 %>%
+  filter(imputed_snap == FALSE) %>%
+  mutate(SNAP_wave2 = ifelse(snap == "SNAP covered", "Yes", "No")) %>%
+  select(ID_nozero, SNAP_wave2)
+
+df_wave3 <- w3 %>%
+  filter(imputed_snap == FALSE) %>%
+  inner_join(snap_w1, by = "ID_nozero") %>%
+  inner_join(snap_w2, by = "ID_nozero") %>%
+  mutate(SNAP = ifelse(snap == "SNAP covered", "Yes", "No")) %>%
+  select(ID_nozero, marital.status, sex, hispanic.origin, race,
+         education, citizenship, employment, state, age, income,
+         SNAP_wave1, SNAP_wave2,   # <-- longitudinal predictors
+         SNAP)
+
+# wave 4 dataset - wave 1,2,3 as longitudinal predictors
+snap_w3 <- w3 %>%
+  filter(imputed_snap == FALSE) %>%
+  mutate(SNAP_wave3 = ifelse(snap == "SNAP covered", "Yes", "No")) %>%
+  select(ID_nozero, SNAP_wave3)
+
+df_wave4 <- w4 %>%
+  filter(imputed_snap == FALSE) %>%
+  inner_join(snap_w1, by = "ID_nozero") %>%
+  inner_join(snap_w2, by = "ID_nozero") %>%
+  inner_join(snap_w3, by = "ID_nozero") %>%
+  mutate(SNAP = ifelse(snap == "SNAP covered", "Yes", "No")) %>%
+  select(ID_nozero, marital.status, sex, hispanic.origin, race,
+         education, citizenship, employment, state, age, income,
+         SNAP_wave1, SNAP_wave2, SNAP_wave3,   # <-- longitudinal predictors
+         SNAP)
+
+# Prepare train-test datasets
+prepare_split <- function(df, seed, train_prop) {
+  df_model <- df %>%
+    select(-ID_nozero) %>%
+    mutate(across(where(is.character), as.factor)) %>%  # convert all character to factor
+    mutate(SNAP = factor(SNAP, levels = c("No", "Yes")))
+  
+  set.seed(seed)
+  idx   <- createDataPartition(df_model$SNAP, p = train_prop, list = FALSE)
+  train <- df_model[ idx, ]
+  test  <- df_model[-idx, ]
+  
+  list(train = train, test = test)
+}
+split_w1 <- prepare_split(df_wave1, seed = 24, train_prop = 0.8)
+split_w2 <- prepare_split(df_wave2, seed = 24, train_prop = 0.7)
+split_w3 <- prepare_split(df_wave3, seed = 24, train_prop = 0.7)
+split_w4 <- prepare_split(df_wave4, seed = 24, train_prop = 0.7)
+
+splits <- list(
+  w1 = split_w1,
+  w2 = split_w2,
+  w3 = split_w3,
+  w4 = split_w4
+)
+
+# Check class distribution of SNAP on the training and test data
+check_class_dist <- function(split, wave_name) {
+  bind_rows(
+    split$train %>% mutate(set = "train"),
+    split$test  %>% mutate(set = "test")
+  ) %>%
+    count(set, SNAP) %>%
+    group_by(set) %>%
+    mutate(pct = round(n / sum(n) * 100, 1)) %>%
+    mutate(wave = wave_name)
+}
+
+bind_rows(
+  check_class_dist(splits$w1, "Wave 1"),
+  check_class_dist(splits$w2, "Wave 2"),
+  check_class_dist(splits$w3, "Wave 3"),
+  check_class_dist(splits$w4, "Wave 4")
+) %>% print(n = 50)
+## Found high class imbalance
+
+## Check missingness
+check_missingness <- function(split, wave_name) {
+  total_na <- sum(is.na(split$train)) + sum(is.na(split$test))
+  cat(wave_name, "— total NA values:", total_na, "\n")
+  if (total_na > 0) {
+    cat("  Columns with NA in train:\n")
+    print(colSums(is.na(split$train))[colSums(is.na(split$train)) > 0])
+  }
+}
+
+check_missingness(splits$w1, "Wave 1")
+check_missingness(splits$w2, "Wave 2")
+check_missingness(splits$w3, "Wave 3")
+check_missingness(splits$w4, "Wave 4")
+
+## found marital status to be missing in wave 3 and 4 for small number of cases (1%) but I am not deleting those cases or imputing them. Rather, I am using 'unknown' as a separate category for these to ensure similar treatment as it had with LLMs.
+# Apply to all four splits — replace NA in marital.status with "Unknown"
+add_unknown_marital <- function(split) {
+  fix <- function(df) {
+    df %>%
+      mutate(marital.status = as.character(marital.status),
+             marital.status = replace_na(marital.status, "Unknown"),
+             marital.status = factor(marital.status))
+  }
+  list(train = fix(split$train),
+       test  = fix(split$test))
+}
+
+splits <- lapply(splits, add_unknown_marital)
+
+# Save all four wave splits as CSVs for Python to read tomorrow
+for (wave in c("w1", "w2", "w3", "w4")) {
+  write.csv(splits[[wave]]$train, 
+            paste0("train_", wave, ".csv"), row.names = FALSE)
+  write.csv(splits[[wave]]$test,  
+            paste0("test_",  wave, ".csv"), row.names = FALSE)
+}
+
+```
+
+## Run baseline models
+
+I am choosing logistic regression, xgboost, CART, random forest and majority class classifier for comparison.
+UPDATE: 4/18 - Reporting LR, RF and XGBoost only.
+
+```{r}
+# Function to compute Expected Calibration Error (ECE) from paper (pg. 9) for baseline models
+compute_ece <- function(prob_yes, actuals, n_bins = 10) {
+  # prob_yes : numeric vector of P(SNAP = Yes)
+  # actuals  : factor with levels c("No", "Yes")
+  
+  y_bin      <- as.integer(actuals == "Yes")
+  bin_edges  <- seq(0, 1, length.out = n_bins + 1)
+  ece        <- 0.0
+  n          <- length(prob_yes)
+  
+  for (i in seq_len(n_bins)) {
+    in_bin <- prob_yes >= bin_edges[i] & prob_yes < bin_edges[i + 1]
+    # Include upper edge in last bin
+    if (i == n_bins) in_bin <- prob_yes >= bin_edges[i] & prob_yes <= bin_edges[i + 1]
+    if (sum(in_bin) == 0) next
+    
+    bin_conf <- mean(prob_yes[in_bin])
+    bin_acc  <- mean(y_bin[in_bin])
+    ece      <- ece + (sum(in_bin) / n) * abs(bin_conf - bin_acc)
+  }
+  round(ece, 4)
+}
+
+# Function to evaluate the model performance and report metrics such as accuracy, recall, precision, F1 and ece
+evaluate_model <- function(model_fit, test_df, outcome_col,
+                           model_name, wave_name, n_bins = 10) {
+  # model_fit  : trained caret model object
+  # test_df    : test data frame (includes outcome_col)
+  # outcome_col: character name of the SNAP column, e.g. "SNAP"
+
+  actuals     <- test_df[[outcome_col]]
+  predictions <- predict(model_fit, newdata = test_df, type = "raw")
+  probs       <- predict(model_fit, newdata = test_df, type = "prob")[, "Yes"]
+
+  cm <- confusionMatrix(predictions, actuals,
+                        positive = "Yes", mode = "prec_recall")
+  tbl <- cm$table
+
+  TP <- tbl["Yes", "Yes"]; TN <- tbl["No",  "No"]
+  FP <- tbl["Yes", "No"];  FN <- tbl["No",  "Yes"]
+
+  precision_yes <- if ((TP + FP) > 0) TP / (TP + FP) else NA_real_
+  recall_yes    <- if ((TP + FN) > 0) TP / (TP + FN) else NA_real_
+  f1_yes        <- if (!is.na(precision_yes) & !is.na(recall_yes) &
+                       (precision_yes + recall_yes) > 0)
+                     2 * precision_yes * recall_yes /
+                       (precision_yes + recall_yes) else NA_real_
+
+  precision_no  <- if ((TN + FN) > 0) TN / (TN + FN) else NA_real_
+  recall_no     <- if ((TN + FP) > 0) TN / (TN + FP) else NA_real_
+  f1_no         <- if (!is.na(precision_no) & !is.na(recall_no) &
+                       (precision_no + recall_no) > 0)
+                     2 * precision_no * recall_no /
+                       (precision_no + recall_no) else NA_real_
+
+  accuracy <- (TP + TN) / (TP + TN + FP + FN)
+  ece      <- compute_ece(probs, actuals, n_bins = n_bins)
+
+  bind_rows(
+    tibble(Wave = wave_name, Model = model_name, Class = "Yes",
+           N_test    = length(actuals),
+           Accuracy  = round(accuracy,      4),
+           Precision = round(precision_yes, 4),
+           Recall    = round(recall_yes,    4),
+           F1        = round(f1_yes,        4),
+           ECE       = ece),
+    tibble(Wave = wave_name, Model = model_name, Class = "No",
+           N_test    = length(actuals),
+           Accuracy  = round(accuracy,     4),
+           Precision = round(precision_no, 4),
+           Recall    = round(recall_no,    4),
+           F1        = round(f1_no,        4),
+           ECE       = ece)          # ECE is model-level, same for both rows
+  )
+}
+
+# ----- Majority class classifier ----------
+### NOT INCLUDED ######
+run_majority <- function(split, wave_name) {
+  preds <- factor(rep("No", nrow(split$test)), levels = c("No", "Yes"))
+  evaluate_model(preds, split$test$SNAP, "Majority Class", wave_name)
+}
+
+res_maj <- bind_rows(
+  run_majority(splits$w1, "Wave 1"),
+  run_majority(splits$w2, "Wave 2"),
+  run_majority(splits$w3, "Wave 3"),
+  run_majority(splits$w4, "Wave 4")
+)
+
+# ----- Logistic regression -----------
+run_logistic <- function(split, wave_name) {
+  ctrl  <- trainControl(method = "none", classProbs = TRUE)
+  model <- train(SNAP ~ ., data = split$train,
+                 method = "glm", family = "binomial",
+                 trControl = ctrl)
+  evaluate_model(model, split$test, "SNAP", "Logistic Regression", wave_name)
+}
+
+res_lr <- bind_rows(
+  run_logistic(splits$w1, "Wave 1"),
+  run_logistic(splits$w2, "Wave 2"),
+  run_logistic(splits$w3, "Wave 3"),
+  run_logistic(splits$w4, "Wave 4")
+)
+
+# ------------- XGBoost --------------------------
+run_xgboost <- function(split, wave_name) {
+  ctrl <- trainControl(method = "none",
+                       classProbs    = TRUE,   
+                       savePredictions = "final")
+  
+  # Must supply exactly one row when method = "none"
+  xgb_grid <- expand.grid(
+    nrounds          = 100,
+    max_depth        = 6,
+    eta              = 0.3,
+    gamma            = 0,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    subsample        = 0.8
+  )
+  
+  model <- train(SNAP ~ ., data = split$train,
+                 method     = "xgbTree",
+                 trControl  = ctrl,
+                 tuneGrid   = xgb_grid,
+                 verbosity  = 0)
+  
+  evaluate_model(model, split$test, "SNAP", "XGBoost", wave_name)
+}
+
+res_xgb <- bind_rows(
+  run_xgboost(splits$w1, "Wave 1"),
+  run_xgboost(splits$w2, "Wave 2"),
+  run_xgboost(splits$w3, "Wave 3"),
+  run_xgboost(splits$w4, "Wave 4")
+)
+
+## CART
+run_cart <- function(split, wave_name) {
+  ctrl  <- trainControl(method = "none", classProbs = TRUE)
+  model <- train(SNAP ~ ., data = split$train,
+                 method = "rpart",
+                 trControl = ctrl)
+  evaluate_model(model, split$test, "SNAP", "CART", wave_name)
+}
+
+
+res_cart <- bind_rows(
+  run_cart(splits$w1, "Wave 1"),
+  run_cart(splits$w2, "Wave 2"),
+  run_cart(splits$w3, "Wave 3"),
+  run_cart(splits$w4, "Wave 4")
+)
+
+## Random forest
+run_rf <- function(split, wave_name) {
+  ctrl  <- trainControl(method = "none", classProbs = TRUE)
+  model <- train(SNAP ~ ., data = split$train,
+                 method    = "rf",
+                 trControl = ctrl,
+                 tuneGrid  = data.frame(mtry = floor(sqrt(ncol(split$train) - 1))),
+                 ntree     = 100)
+  evaluate_model(model, split$test, "SNAP", "Random Forest", wave_name)
+}
+res_rf <- bind_rows(
+  run_rf(splits$w1, "Wave 1"),
+  run_rf(splits$w2, "Wave 2"),
+  run_rf(splits$w3, "Wave 3"),
+  run_rf(splits$w4, "Wave 4")
+)
+
+results_baselines <- bind_rows(
+  #res_maj,
+  res_lr,
+  res_cart,
+  res_rf,
+  res_xgb
+) %>%
+  arrange(Wave, Model)
+
+print(results_baselines, n = 60)
+write.csv(results_baselines, "baseline_results.csv", row.names = FALSE)
+
+
+```
+
+## Handling class imbalance - minority class oversampled in training set
+
+```{r}
+# ── Balanced runner for caret-compatible models (LR, CART, RF) ───────────────
+run_model_balanced <- function(split, wave_name, method, model_name,
+                               tuneGrid = NULL) {
+  train_bal <- ROSE(SNAP ~ ., data = split$train, seed = 22)$data %>%
+    mutate(SNAP = factor(SNAP, levels = c("No", "Yes")))
+
+  ctrl <- trainControl(method = "none", classProbs = TRUE)  
+  args <- list(SNAP ~ ., data = train_bal,
+               method = method, trControl = ctrl)
+  if (!is.null(tuneGrid)) args$tuneGrid <- tuneGrid
+  if (method == "glm")    args$family   <- "binomial"
+
+  model <- do.call(train, args)
+
+  
+  evaluate_model(model, split$test, "SNAP", model_name, wave_name)
+}
+
+# ---- XGBoost with scale_pos_weight (native xgboost, not caret) -------------
+run_xgboost_weighted <- function(split, wave_name) {
+  X_train <- model.matrix(SNAP ~ . - 1, data = split$train)
+  X_test  <- model.matrix(SNAP ~ . - 1, data = split$test)
+  y_train <- as.numeric(split$train$SNAP == "Yes")
+  y_test  <- split$test$SNAP
+
+  spw    <- sum(y_train == 0) / sum(y_train == 1)
+  dtrain <- xgb.DMatrix(X_train, label = y_train)
+  dtest  <- xgb.DMatrix(X_test)
+
+  params <- list(objective        = "binary:logistic",
+                 eval_metric      = "logloss",
+                 eta              = 0.1,
+                 max_depth        = 6,
+                 scale_pos_weight = spw,
+                 nthread          = 4)
+
+  model <- xgb.train(params, dtrain, nrounds = 100, verbose = 0)
+  probs <- predict(model, dtest)                                    # P(SNAP = Yes)
+  preds <- factor(ifelse(probs >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+  # ------- Manual evaluation (native xgboost has no caret interface) -----------------
+  cm  <- confusionMatrix(preds, y_test, positive = "Yes", mode = "prec_recall")
+  tbl <- cm$table
+  TP  <- tbl["Yes","Yes"]; TN <- tbl["No","No"]
+  FP  <- tbl["Yes","No"];  FN <- tbl["No","Yes"]
+
+  prec_yes <- if ((TP+FP)>0) TP/(TP+FP) else NA_real_
+  rec_yes  <- if ((TP+FN)>0) TP/(TP+FN) else NA_real_
+  f1_yes   <- if (!is.na(prec_yes)&!is.na(rec_yes)&(prec_yes+rec_yes)>0)
+                2*prec_yes*rec_yes/(prec_yes+rec_yes) else NA_real_
+  prec_no  <- if ((TN+FN)>0) TN/(TN+FN) else NA_real_
+  rec_no   <- if ((TN+FP)>0) TN/(TN+FP) else NA_real_
+  f1_no    <- if (!is.na(prec_no)&!is.na(rec_no)&(prec_no+rec_no)>0)
+                2*prec_no*rec_no/(prec_no+rec_no) else NA_real_
+  acc      <- (TP+TN)/(TP+TN+FP+FN)
+  ece      <- compute_ece(probs, y_test)
+
+  bind_rows(
+    tibble(Wave=wave_name, Model="XGBoost (Weighted)", Class="Yes",
+           N_test=length(y_test), Accuracy=round(acc,4),
+           Precision=round(prec_yes,4), Recall=round(rec_yes,4),
+           F1=round(f1_yes,4), ECE=ece),
+    tibble(Wave=wave_name, Model="XGBoost (Weighted)", Class="No",
+           N_test=length(y_test), Accuracy=round(acc,4),
+           Precision=round(prec_no,4), Recall=round(rec_no,4),
+           F1=round(f1_no,4), ECE=ece)
+  )
+}
+
+# ----------- Run all balanced models ----------------------------
+wave_list  <- list(w1 = "Wave 1", w2 = "Wave 2", w3 = "Wave 3", w4 = "Wave 4")
+
+res_balanced <- bind_rows(
+  # Logistic Regression (ROSE)
+  map_dfr(names(wave_list), ~run_model_balanced(
+    splits[[.x]], wave_list[[.x]], "glm", "Logistic Regression (ROSE)")),
+
+  # CART (ROSE)
+  map_dfr(names(wave_list), ~run_model_balanced(
+    splits[[.x]], wave_list[[.x]], "rpart", "CART (ROSE)",
+    tuneGrid = data.frame(cp = 0.01))),
+
+  # Random Forest (ROSE)
+  map_dfr(names(wave_list), ~run_model_balanced(
+    splits[[.x]], wave_list[[.x]], "rf", "Random Forest (ROSE)",
+    tuneGrid = data.frame(mtry = floor(sqrt(ncol(splits[[.x]]$train) - 1))))),
+
+  # XGBoost (scale_pos_weight — native)
+  map_dfr(names(wave_list), ~run_xgboost_weighted(splits[[.x]], wave_list[[.x]]))
+)
+
+# ── Combine with baseline results ────────────────────────────────────────────
+results_all <- bind_rows(results_baselines, res_balanced) %>%
+  arrange(Wave, Model, Class)
+
+write.csv(results_all, "baseline_results_full.csv", row.names = FALSE)
+
+```
+
+# Ablation experiment - temporal signal decomposition 
+
+```{r}
+## --- Ablation runner for caret-compatible models -------------------------
+run_ablation <- function(split, wave_name, predictors, label, method,
+                         tuneGrid = NULL) {
+  df_tr <- split$train %>% select(all_of(c(predictors, "SNAP")))
+  df_te <- split$test  %>% select(all_of(c(predictors, "SNAP")))
+
+  ctrl <- trainControl(method = "none", classProbs = TRUE)  # classProbs for ECE
+  args <- list(SNAP ~ ., data = df_tr, method = method, trControl = ctrl)
+  if (method == "glm")    args$family   <- "binomial"
+  if (!is.null(tuneGrid)) args$tuneGrid <- tuneGrid
+
+  model <- do.call(train, args)
+
+  
+  evaluate_model(model, df_te, "SNAP", label, wave_name)
+}
+
+# ----------- XGBoost ablation — native xgboost, manual evaluation + ECE ----------------------
+run_ablation_xgb <- function(split, wave_name, predictors, label) {
+  df_tr <- split$train %>% select(all_of(c(predictors, "SNAP")))
+  df_te <- split$test  %>% select(all_of(c(predictors, "SNAP")))
+
+  X_tr  <- model.matrix(SNAP ~ . - 1, data = df_tr)
+  X_te  <- model.matrix(SNAP ~ . - 1, data = df_te)
+  y_tr  <- as.numeric(df_tr$SNAP == "Yes")
+  y_te  <- df_te$SNAP
+
+  model <- xgb.train(
+    list(objective = "binary:logistic", eta = 0.1,
+         max_depth = 6, nthread = 4),
+    xgb.DMatrix(X_tr, label = y_tr),
+    nrounds = 100, verbose = 0
+  )
+
+  probs <- predict(model, xgb.DMatrix(X_te))
+  preds <- factor(ifelse(probs >= 0.5, "Yes", "No"), levels = c("No", "Yes"))
+
+  
+  cm  <- confusionMatrix(preds, y_te, positive = "Yes", mode = "prec_recall")
+  tbl <- cm$table
+  TP  <- tbl["Yes","Yes"]; TN <- tbl["No","No"]
+  FP  <- tbl["Yes","No"];  FN <- tbl["No","Yes"]
+
+  prec_yes <- if ((TP+FP)>0) TP/(TP+FP) else NA_real_
+  rec_yes  <- if ((TP+FN)>0) TP/(TP+FN) else NA_real_
+  f1_yes   <- if (!is.na(prec_yes)&!is.na(rec_yes)&(prec_yes+rec_yes)>0)
+                2*prec_yes*rec_yes/(prec_yes+rec_yes) else NA_real_
+  prec_no  <- if ((TN+FN)>0) TN/(TN+FN) else NA_real_
+  rec_no   <- if ((TN+FP)>0) TN/(TN+FP) else NA_real_
+  f1_no    <- if (!is.na(prec_no)&!is.na(rec_no)&(prec_no+rec_no)>0)
+                2*prec_no*rec_no/(prec_no+rec_no) else NA_real_
+  acc      <- (TP+TN)/(TP+TN+FP+FN)
+  ece      <- compute_ece(probs, y_te)
+
+  bind_rows(
+    tibble(Wave=wave_name, Model=label, Class="Yes",
+           N_test=length(y_te), Accuracy=round(acc,4),
+           Precision=round(prec_yes,4), Recall=round(rec_yes,4),
+           F1=round(f1_yes,4), ECE=ece),
+    tibble(Wave=wave_name, Model=label, Class="No",
+           N_test=length(y_te), Accuracy=round(acc,4),
+           Precision=round(prec_no,4), Recall=round(rec_no,4),
+           F1=round(f1_no,4), ECE=ece)
+  )
+}
+
+# --------------- Predictor sets-------------------------------------------
+demo_vars <- c("marital.status","sex","hispanic.origin","race",
+               "education","citizenship","employment","state","age","income")
+snap_w2   <- c("SNAP_wave1")
+snap_w3   <- c("SNAP_wave1","SNAP_wave2")
+snap_w4   <- c("SNAP_wave1","SNAP_wave2","SNAP_wave3")
+
+# ----------- Function: run all four models for one wave/predictor combination-------------------
+run_all_models <- function(split, wave, preds, suffix) {
+  bind_rows(
+    run_ablation(split, wave, preds,
+                 paste("LR -", suffix), "glm"),
+    run_ablation(split, wave, preds,
+                 paste("CART -", suffix), "rpart",
+                 tuneGrid = data.frame(cp = 0.01)),
+    run_ablation(split, wave, preds,
+                 paste("RF -", suffix), "rf",
+                 tuneGrid = data.frame(mtry = floor(sqrt(length(preds))))),
+    run_ablation_xgb(split, wave, preds,
+                     paste("XGBoost -", suffix))
+  )
+}
+
+# ----------- Run ablation ---------------------------
+ablation_results <- bind_rows(
+
+  # Wave 1 — demographics only (no SNAP history available)
+  run_all_models(splits$w1, "Wave 1", demo_vars, "Demographics Only"),
+
+  # Wave 2
+  run_all_models(splits$w2, "Wave 2", demo_vars,             "Demographics Only"),
+  run_all_models(splits$w2, "Wave 2", snap_w2,               "SNAP History Only"),
+  run_all_models(splits$w2, "Wave 2", c(demo_vars, snap_w2), "Full Model"),
+
+  # Wave 3
+  run_all_models(splits$w3, "Wave 3", demo_vars,             "Demographics Only"),
+  run_all_models(splits$w3, "Wave 3", snap_w3,               "SNAP History Only"),
+  run_all_models(splits$w3, "Wave 3", c(demo_vars, snap_w3), "Full Model"),
+
+  # Wave 4
+  run_all_models(splits$w4, "Wave 4", demo_vars,             "Demographics Only"),
+  run_all_models(splits$w4, "Wave 4", snap_w4,               "SNAP History Only"),
+  run_all_models(splits$w4, "Wave 4", c(demo_vars, snap_w4), "Full Model")
+)
+
+print(ablation_results, n = 100)
+write.csv(ablation_results, "ablation_results.csv", row.names = FALSE)
+
+```
+
+## Subgroup analyses [NOT IN THIS ARTICLE]
+
+```{r}
+# -------------- subgroup performance -----------------------------------------------
+subgroup_performance <- function(test_data, preds, group_var, model_name) {
+  test_data %>%
+    mutate(.pred = preds) %>%
+    group_by(across(all_of(group_var))) %>%
+    summarise(
+      model      = model_name,
+      wave       = unique(wave),          
+      subgroup   = group_var,
+      group_val  = cur_group()[[1]],
+      N          = n(),
+      Accuracy   = mean(.pred == SNAP),
+      Recall     = {
+        tp <- sum(.pred == "Yes" & SNAP == "Yes")
+        fn <- sum(.pred == "No"  & SNAP == "Yes")
+        ifelse((tp + fn) == 0, NA, tp / (tp + fn))
+      },
+      Precision  = {
+        tp <- sum(.pred == "Yes" & SNAP == "Yes")
+        fp <- sum(.pred == "Yes" & SNAP == "No")
+        ifelse((tp + fp) == 0, NA, tp / (tp + fp))
+      },
+      F1 = ifelse(is.na(Recall) | is.na(Precision) | (Recall + Precision) == 0,
+                  NA, 2 * Recall * Precision / (Recall + Precision)),
+      .groups = "drop"
+    )
+}
+
+# ------------ Fit & predict for one wave -----------------------
+run_wave_subgroups <- function(wave_splits, wave_label, subgroup_vars) {
+  
+  train_d <- wave_splits$train
+  test_d  <- wave_splits$test
+  ctrl    <- trainControl(method = "none")
+  
+  # --- Logistic Regression ---
+  lr_fit   <- train(SNAP ~ ., data = train_d, method = "glm",
+                    family = "binomial", trControl = ctrl)
+  lr_preds <- predict(lr_fit, test_d)
+  
+  # --- CART ---
+  cart_fit   <- train(SNAP ~ ., data = train_d, method = "rpart",
+                      trControl = ctrl,
+                      tuneGrid = data.frame(cp = 0.01))
+  cart_preds <- predict(cart_fit, test_d)
+  
+  # --- Random Forest ---
+  rf_fit   <- train(SNAP ~ ., data = train_d, method = "rf",
+                    trControl = ctrl,
+                    tuneGrid = data.frame(mtry = floor(sqrt(ncol(train_d) - 1))),
+                    ntree = 100)
+  rf_preds <- predict(rf_fit, test_d)
+  
+  # --- XGBoost ---
+  X_tr    <- model.matrix(SNAP ~ . - 1, data = train_d)
+  X_te    <- model.matrix(SNAP ~ . - 1, data = test_d)
+  y_tr    <- as.numeric(train_d$SNAP == "Yes")
+  xgb_fit <- xgb.train(
+    params   = list(objective = "binary:logistic", eta = 0.1,
+                    max_depth = 6, nthread = 4),
+    data     = xgb.DMatrix(X_tr, label = y_tr),
+    nrounds  = 100,
+    verbose  = 0
+  )
+  xgb_preds <- factor(
+    ifelse(predict(xgb_fit, xgb.DMatrix(X_te)) >= 0.5, "Yes", "No"),
+    levels = c("No", "Yes")
+  )
+  
+  # --- Subgroup results for this wave ---
+  test_d$wave <- wave_label   # tag the wave so it surfaces in output
+  
+  bind_rows(
+    map_dfr(subgroup_vars, ~subgroup_performance(test_d, lr_preds,   .x, "Logistic Regression")),
+    map_dfr(subgroup_vars, ~subgroup_performance(test_d, cart_preds, .x, "CART")),
+    map_dfr(subgroup_vars, ~subgroup_performance(test_d, rf_preds,   .x, "Random Forest")),
+    map_dfr(subgroup_vars, ~subgroup_performance(test_d, xgb_preds,  .x, "XGBoost"))
+  )
+}
+
+# ------------Run across all four waves --------------------------
+subgroup_vars <- c("race", "education", "employment", "income")
+
+all_wave_subgroup_results <- bind_rows(
+  run_wave_subgroups(splits$w1, "Wave 1", subgroup_vars),
+  run_wave_subgroups(splits$w2, "Wave 2", subgroup_vars),
+  run_wave_subgroups(splits$w3, "Wave 3", subgroup_vars),
+  run_wave_subgroups(splits$w4, "Wave 4", subgroup_vars)
+)
+
+# ── Inspect & save ────────────────────────────────────────────────────────────
+print(all_wave_subgroup_results, n = 200)
+write.csv(all_wave_subgroup_results, "subgroup_results_all_waves.csv", row.names = FALSE)
+```
+
+
+## Attrition analysis (whether retaining the part of the sample introduces systematic bias?)
+
+
+```{r}
+# ------------ 1. BUILD THE RETAINED/ATTRITED FLAG ------------------------
+baseline_w1 <- w1 %>%
+  filter(imputed_snap == FALSE) %>%
+  select(ID_nozero, marital.status, sex, hispanic.origin,
+         race, education, citizenship, employment, state, age, income,
+         snap)   # ── NEW: include Wave 1 SNAP outcome
+
+ids_w2 <- w2 %>% filter(imputed_snap == FALSE) %>% pull(ID_nozero)
+ids_w3 <- w3 %>% filter(imputed_snap == FALSE) %>% pull(ID_nozero)
+ids_w4 <- w4 %>% filter(imputed_snap == FALSE) %>% pull(ID_nozero)
+
+ids_retained <- Reduce(intersect, list(
+  baseline_w1$ID_nozero, ids_w2, ids_w3, ids_w4
+))
+
+attrition_df <- baseline_w1 %>%
+  mutate(
+    status = if_else(ID_nozero %in% ids_retained, "Retained", "Attrited"),
+    status = factor(status, levels = c("Retained", "Attrited"))
+  )
+
+cat("Wave 1 baseline N        :", nrow(attrition_df), "\n")
+cat("Retained across all waves:", sum(attrition_df$status == "Retained"), "\n")
+cat("Attrited (≥1 wave missing):", sum(attrition_df$status == "Attrited"), "\n")
+cat("Attrition rate            :",
+    round(mean(attrition_df$status == "Attrited") * 100, 1), "%\n")
+
+
+# ── 2. SMD HELPER FUNCTIONS ──────────────────────────────────────────────────  # ── NEW
+smd_continuous <- function(x, group) {
+  # Cohen's d using pooled SD
+  vals   <- split(as.numeric(as.character(x)), group)
+  m_diff <- mean(vals[["Retained"]], na.rm = TRUE) -
+            mean(vals[["Attrited"]],  na.rm = TRUE)
+  pooled_sd <- sqrt((var(vals[["Retained"]], na.rm = TRUE) +
+                     var(vals[["Attrited"]],  na.rm = TRUE)) / 2)
+  round(abs(m_diff / pooled_sd), 3)
+}
+
+smd_categorical <- function(var_vec, group_vec) {
+  # Average of absolute SMDs across all categories (for multi-level vars)
+  cats <- levels(factor(var_vec))
+  smds <- sapply(cats, function(cat) {
+    p1 <- mean(var_vec[group_vec == "Retained"] == cat, na.rm = TRUE)
+    p2 <- mean(var_vec[group_vec == "Attrited"]  == cat, na.rm = TRUE)
+    p_bar <- (p1 + p2) / 2
+    denom <- sqrt(p_bar * (1 - p_bar))
+    if (denom == 0) return(0)
+    abs(p1 - p2) / denom
+  })
+  round(mean(smds), 3)
+}
+
+
+# ------------ 3. DEMOGRAPHIC COMPARISON TABLE ------------------------------------------
+demo_vars <- c("snap",                                           # ── NEW
+               "sex", "race", "hispanic.origin", "education",
+               "marital.status", "employment", "citizenship", "income")
+
+# Age (continuous)
+age_summary <- attrition_df %>%
+  group_by(status) %>%
+  summarise(
+    mean_age = round(mean(as.numeric(as.character(age)), na.rm = TRUE), 1),
+    sd_age   = round(sd(as.numeric(as.character(age)),  na.rm = TRUE), 1),
+    .groups  = "drop"
+  ) %>%
+  mutate(label = paste0(mean_age, " (", sd_age, ")")) %>%
+  select(status, label) %>%
+  pivot_wider(names_from = status, values_from = label) %>%
+  mutate(
+    Variable = "Age",
+    Category = "Mean (SD)",
+    p_value  = {
+      age_num <- as.numeric(as.character(attrition_df$age))
+      t.test(age_num ~ attrition_df$status)$p.value
+    },
+    SMD = smd_continuous(attrition_df$age, attrition_df$status)  # ── NEW
+  )
+
+# Categorical variables
+make_cat_table <- function(var) {
+  tbl <- attrition_df %>%
+    group_by(status, .data[[var]]) %>%
+    tally() %>%
+    group_by(status) %>%
+    mutate(pct = round(n / sum(n) * 100, 1)) %>%
+    mutate(cell = paste0(n, " (", pct, "%)")) %>%
+    select(status, category = all_of(var), cell) %>%
+    pivot_wider(names_from = status, values_from = cell,
+                values_fill = "0 (0.0%)") %>%
+    mutate(Variable = var)
+
+  chi_p <- tryCatch(
+    chisq.test(table(attrition_df$status, attrition_df[[var]]))$p.value,
+    error = function(e) NA_real_
+  )
+
+  smd_val <- smd_categorical(attrition_df[[var]], attrition_df$status)  # ── NEW
+
+  tbl %>%
+    mutate(
+      p_value = if_else(row_number() == 1, chi_p, NA_real_),
+      SMD     = if_else(row_number() == 1, smd_val, NA_real_)           # ── NEW
+    )
+}
+
+cat_tables <- bind_rows(lapply(demo_vars, make_cat_table)) %>%
+  rename(Category = category)
+
+# Format p-values
+fmt_p <- function(p) {
+  case_when(
+    is.na(p)   ~ "",
+    p < 0.001  ~ "<0.001",
+    p < 0.01   ~ format(round(p, 3), nsmall = 3),
+    TRUE       ~ format(round(p, 2), nsmall = 2)
+  )
+}
+
+# Combine
+attrition_table <- bind_rows(
+  cat_tables %>% select(Variable, Category, Retained, Attrited, p_value, SMD),
+  age_summary %>% select(Variable, Category, Retained, Attrited, p_value, SMD)
+) %>%
+  arrange(Variable) %>%
+  mutate(p_value = fmt_p(p_value),
+         SMD     = if_else(is.na(SMD), "", as.character(SMD)))  # ── NEW
+
+# ── 4. OUTPUT ─────────────────────────────────────────────────────────────────
+attrition_table %>%
+  select(Variable, Category, Retained, Attrited,
+         `p-value` = p_value, SMD) %>%           # ── NEW: SMD column added
+  kable(
+    format   = "latex",
+    booktabs = TRUE,
+    caption  = "Demographic characteristics of retained versus attrited
+respondents. Retained respondents were observed across all four SIPP waves
+with non-imputed SNAP outcomes; attrited respondents were present at
+Wave~1 but missing from at least one subsequent wave. Percentages are
+column proportions within each group. $p$-values are from chi-square tests
+(categorical variables) and two-sample $t$-tests (age). SMD denotes the
+standardized mean difference; values $\\geq 0.10$ indicate meaningful
+imbalance. Attrited respondents are systematically younger, less educated,
+more likely to be never married, and more likely to belong to racial and
+ethnic minority groups, consistent with positive selection of the retained
+sample on socioeconomic stability. See Appendix~\\ref{app:attrition} for
+implications for generalizability.",
+    label    = "tab:attrition"
+  ) %>%
+  kable_styling(latex_options = c("hold_position", "scale_down")) %>%
+  collapse_rows(columns = 1, latex_hline = "major")
+
+write.csv(attrition_table, "attrition_table2_appendix.csv", row.names = FALSE)
+
+# ── 3. WAVE-BY-WAVE SAMPLE FLOW TABLE ────────────────────────────────────────
+# Shows N retained at each cumulative threshold — useful for the paper body
+
+wave_flow <- tibble(
+  Wave = c("Wave 1 (baseline)", "Through Wave 2",
+           "Through Wave 3", "Through Wave 4"),
+  N_nonimputed = c(
+    nrow(baseline_w1),
+    length(intersect(baseline_w1$ID_nozero, ids_w2)),
+    length(Reduce(intersect, list(baseline_w1$ID_nozero, ids_w2, ids_w3))),
+    length(ids_retained)
+  )
+) %>%
+  mutate(
+    Pct_of_baseline = round(N_nonimputed / nrow(baseline_w1) * 100, 1),
+    Wave_to_wave_loss = N_nonimputed - lag(N_nonimputed, default = N_nonimputed[1]),
+    Wave_to_wave_loss = if_else(Wave_to_wave_loss == 0, NA_integer_, -Wave_to_wave_loss)
+  )
+
+print(wave_flow)
+
+wave_flow %>%
+  rename(
+    `Cumulative N` = N_nonimputed,
+    `% of Wave 1`  = Pct_of_baseline,
+    `N lost`       = Wave_to_wave_loss
+  ) %>%
+  kable(
+    format   = "latex",
+    booktabs = TRUE,
+    caption  = "Cumulative sample retention across waves. Only respondents with self-reported (non-imputed) SNAP outcomes at all prior waves are retained.",
+    label    = "tab:wave_flow"
+  ) %>%
+  kable_styling(latex_options = "hold_position")
+
+
+# ----------- 4. ATTRITION PROFILE FIGURE --------------------------
+# Grouped bar chart: % distribution of key demographics by retained/attrited
+# Keeps the figure compact — use the 4 most policy-relevant variables
+
+plot_vars <- c("sex", "race", "education", "marital.status", "employment")
+
+plot_df <- bind_rows(lapply(plot_vars, function(var) {
+  attrition_df %>%
+    group_by(status, cat = .data[[var]]) %>%
+    tally() %>%
+    group_by(status) %>%
+    mutate(pct = n / sum(n) * 100) %>%
+    mutate(variable = var)
+}))
+
+ggplot(plot_df, aes(x = cat, y = pct, fill = status)) +
+  geom_col(position = "dodge", width = 0.7) +
+  facet_wrap(~ variable, scales = "free_x", ncol = 3) +
+  scale_fill_manual(
+    values = c("Retained" = "#2166ac", "Attrited" = "#d6604d"),
+    name   = NULL
+  ) +
+  labs(
+    x     = NULL,
+    y     = "Percentage within group (%)",
+    title = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 35, hjust = 1, size = 8),
+    strip.background = element_rect(fill = "grey92"),
+    strip.text       = element_text(face = "bold"),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("appendix_attrition_profile.pdf", width = 7, height = 6)
+cat("Figure saved: appendix_attrition_profile.pdf\n")
+```
