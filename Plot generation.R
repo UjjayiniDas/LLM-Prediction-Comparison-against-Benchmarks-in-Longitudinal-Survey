@@ -9,7 +9,7 @@ library(showtext)
 font_add_google("Caladea", "caladea")
 showtext_auto()
 
-# ── Data ──────────────────────────────────────────────────────────────────
+# Data 
 df <- tibble::tribble(
   ~Wave, ~Model,                ~F1,
   1,     "Logistic Regression", 0.941,
@@ -37,7 +37,7 @@ df$Model <- factor(df$Model,
                               "Random Forest",
                               "XGBoost"))
 
-# ── Palette (colorblind-safe) ─────────────────────────────────────────────
+#  Palette
 # Using manual colors from the Okabe-Ito palette
 model_colors <- c(
   "Qwen2.5"             = "#E69F00",
@@ -53,7 +53,7 @@ model_shapes <- c(
   "XGBoost"             = 18   # filled diamond
 )
 
-# ── Plot ──────────────────────────────────────────────────────────────────
+# Plot
 p <- ggplot(df, aes(x = Wave, y = F1,
                     color = Model,
                     shape = Model,
@@ -90,7 +90,7 @@ p <- ggplot(df, aes(x = Wave, y = F1,
     panel.grid.major.x   = element_blank()
   )
 
-# ── Save ──────────────────────────────────────────────────────────────────
+# Save
 ggsave("majority_f1_trajectory.pdf", plot = p,
        width = 6, height = 4, units = "in", dpi = 300)
 
@@ -100,7 +100,7 @@ ggsave("majority_f1_trajectory.png", plot = p,
 
 ### Plot 2: Metrics trajectory for minority class over waves (imbalanced full model) ###
 
-# ── Data ─────────────────────────────────────────────────────────────────────
+#  Data 
 df2 <- tibble::tribble(
   ~Wave, ~Model,                  ~Precision, ~Recall, ~F1,
   1, "Logistic Regression",   0.618, 0.240, 0.345,
@@ -140,7 +140,7 @@ df_long <- df2 %>%
     Metric = factor(Metric, levels = c("Precision", "Recall", "F1"))
   )
 
-# ── Aesthetics ────────────────────────────────────────────────────────────────
+#  Aesthetics 
 model_colors <- c(
   "Logistic Regression"  = "#0072B2",
   "Random Forest"        = "#009E73",
@@ -248,7 +248,7 @@ ggsave("metrics_trajectory_all.png", plot = p2_all,
 ### Plot 3: ECE plots ###
 
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+#  Data 
 df3 <- data.frame(
   wave = c(
     1,1,1,1,
@@ -273,7 +273,7 @@ df3 <- data.frame(
   )
 )
 
-# ── Facet assignment ──────────────────────────────────────────────────────────
+#  Facet assignment 
 df3_f1 <- df3 |>
   filter(condition %in% c("Zero-shot", "Imbalanced (Full Model)")) |>
   mutate(facet = "Training Regime\n(Zero-shot vs. Fine-tuned)")
@@ -293,7 +293,7 @@ wave1_additions <- data.frame(
   wave      = c(1, 1),
   condition = c("Demo Only", "Minimal Imbalanced"),
   ECE       = c(0.093, 0.118),
-  facet     = "Feature Configuration"   # must match exactly
+  facet     = "Feature Configuration"   
 )
 
 df3_f3 <- bind_rows(df3_f3, wave1_additions)
@@ -316,7 +316,7 @@ df3_plot <- bind_rows(df3_f1, df3_f2, df3_f3, df3_f4) |>
     ))
   )
 
-# ── Colorblind-safe palette (Wong 2011) + matched linetypes ──────────────────
+#  Colorblind-safe palette (Wong 2011) + matched linetypes 
 pal <- c(
   "Imbalanced (Full Model)" = "#0072B2",
   "Zero-shot"               = "#D55E00",
@@ -337,7 +337,7 @@ lty <- c(
   "Minimal Imbalanced"      = "longdash"
 )
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
+#  Plot 
 p3 <- ggplot(df3_plot, aes(x = wave, y = ECE,
                            color = condition, linetype = condition,
                            group = condition)) +
@@ -379,3 +379,90 @@ p3 <- ggplot(df3_plot, aes(x = wave, y = ECE,
 
 ggsave("ece_calibration_facets.pdf", plot = p3,
        width = 9, height = 7, dpi = 300, bg = "white")
+
+### Plot 4: Imbalance Correction Comparison (Figure 4) ###
+df4 <- data.frame(
+  model = rep(c("Logistic Regression", "Random Forest", "XGBoost", "LLM"), each = 4),
+  wave  = rep(c("Wave 1", "Wave 2", "Wave 3", "Wave 4"), times = 4),
+  imbalanced = c(0.345, 0.802, 0.821, 0.805,
+                 0.042, 0.601, 0.778, 0.787,
+                 0.402, 0.807, 0.825, 0.825,
+                 0.320, 0.220, 0.830, 0.810),
+  corrected  = c(0.462, 0.743, 0.781, 0.788,
+                 0.460, 0.702, 0.782, 0.795,
+                 0.497, 0.752, 0.804, 0.802,
+                 0.440, 0.540, 0.790, 0.800),
+  delta      = c(+11.7, -5.9, -4.0, -1.6,
+                 +41.8, +10.1, +0.5, +0.9,
+                 +9.4,  -5.4, -2.2, -2.2,
+                 +12.0, +32.0, -4.0, -1.0)
+) |>
+  mutate(
+    wave  = factor(wave,  levels = c("Wave 1","Wave 2","Wave 3","Wave 4")),
+    model = factor(model, levels = c("Logistic Regression", "Random Forest", "XGBoost", "LLM")),
+    delta_label = ifelse(delta > 0, paste0("+", delta, "pp"), paste0(delta, "pp")),
+    delta_sign  = ifelse(delta > 0, "positive", "negative"),
+    y_top = pmax(imbalanced, corrected) + 0.055
+  )
+
+# Pivot to long for geom_col
+df_long4 <- df4 |>
+  pivot_longer(cols = c(imbalanced, corrected),
+               names_to  = "condition",
+               values_to = "F1") |>
+  mutate(condition = factor(condition,
+                            levels = c("imbalanced", "corrected"),
+                            labels = c("Imbalanced", "Corrected")))
+
+
+p4 <- ggplot(df_long4, aes(x = wave, y = F1, fill = condition)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+
+  # Delta annotations
+  geom_text(
+    data = df4,
+    aes(x = wave, y = y_top, label = delta_label, color = delta_sign),
+    inherit.aes = FALSE,
+    size = 3, fontface = "bold", hjust = 0.5
+  ) +
+
+  scale_fill_manual(
+    values = c("Imbalanced" = "#a8c4e0", "Corrected" = "#1f6fa8"),
+    name   = "Training condition"
+  ) +
+  scale_color_manual(
+    values = c("positive" = "#1a7d3a", "negative" = "#c0392b"),
+    guide  = "none"
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1.05),
+    breaks = seq(0, 1, by = 0.2),
+    labels = scales::number_format(accuracy = 0.1)
+  ) +
+
+  facet_wrap(~ model, ncol = 2) +
+
+  labs(
+    x       = NULL,
+    y       = "F1 Score",
+    title   = "F1 Score: Imbalanced vs. Corrected Training by Model and Wave",
+    caption = "Annotations show difference in F1 in percentage points.\nGreen = net gain from correction; red = imbalanced model yields higher F1.\nCorrection method: ROSE (LR, RF, LLM); class-weighted loss (XGBoost)."
+  ) +
+
+  theme_bw(base_size = 11, base_family = "caladea") +
+  theme(
+    strip.background  = element_rect(fill = "#f0f0f0", color = "grey60"),
+    strip.text        = element_text(face = "bold", size = 10),
+    legend.position   = "bottom",
+    legend.title      = element_text(face = "bold", size = 9),
+    legend.text       = element_text(size = 9),
+    axis.text.x       = element_text(angle = 30, hjust = 1, size = 8.5),
+    axis.title.y      = element_text(size = 10),
+    panel.grid.minor  = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.title        = element_text(face = "bold", size = 11, hjust = 0.5),
+    plot.caption      = element_text(size = 7.5, color = "black", hjust = 0)
+  )
+
+ggsave("imbalance_f1_facets.pdf", plot = p4,
+       width = 8, height = 6, dpi = 300, bg = "white")
